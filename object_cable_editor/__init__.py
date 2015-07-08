@@ -20,7 +20,7 @@
 bl_info = {
     "name": "Cable Editor",
     "author": "dairin0d, moth3r",
-    "version": (0, 5, 0),
+    "version": (0, 5, 1),
     "blender": (2, 7, 0),
     "location": "",
     "description": "Cable editor",
@@ -51,7 +51,8 @@ except ImportError:
 
 exec("""
 from {0}dairin0d.utils_view3d import SmartView3D
-from {0}dairin0d.utils_blender import MeshBaker
+from {0}dairin0d.utils_blender import MeshBaker, BlUtil
+from {0}dairin0d.utils_math import clamp_angle
 from {0}dairin0d.utils_userinput import KeyMapUtils
 from {0}dairin0d.utils_ui import NestedLayout, find_ui_area, ui_context_under_coord
 from {0}dairin0d.bpy_inspect import prop, BlRna
@@ -64,14 +65,28 @@ addon = AddonManager()
 
 """
 cable editor:
-  moth3r asks to implement presets system
 + add option to scale attachments
 + make children non-selectable by default
 + add operators to duplicate/delete whole hierarchy (also, toggle visibility of cable/all children at once): decide to just add the ability to select whole hierarchy
 + make selectability of children togglable from main cable UI?
 + attachments: assign materials from the main UI
-  Auto-twisting: fix start point, fix end point, fix some point in between? twist per length, twist n times
-  Check if it's possible to make wires/attachments stay with cable in Local View mode
++ auto-twisting: fix start point, fix end point, fix some point in between? twist per length, twist n times
++ check if it's possible to make wires/attachments stay with cable in Local View mode
+    issues I cannot fix:
+    * when entering local view, the view zooms out to show local-view objects. Length calculator can be a very large object, depending on curve length
+    * when going out of local view, all local-view objects are selected (and made selectable)
++ add Edge Split modifier options for cable
++ add curve fill mode to the Cable panel
++ operator to make cable children non-selectable
+  multi-row bus cable
+  multiple layers of wires
+  implement fix for scaling wires
+  moth3r asks to implement presets system
+  moth3r asks for procedural custom curve profiles
+  moth3r suggests to provide the ability to use particles and selected vertices as targets for cables'/wires' ends
+  add option for "sides" profile (as seen in the example moth3r showed)
+
+add warnings to documentation about issues with scale, default coversion to mesh, joining multiple curves into one object, etc.
 
 For cable systems:
 * hub in, hub out (also can be auto-generated?). Hubs can be implemented via armatures (bones with matching names)
@@ -120,6 +135,7 @@ class DATA_PT_curve_cable:
         
         with layout.row():
             layout.operator("object.select_whole_subheirarchy", text="Select whole")
+            layout.operator("object.cable_unselect_children", text="Unselect")
             layout.operator("object.cable_to_mesh", text="To mesh")
         
         with layout.split(0.15):
@@ -152,6 +168,7 @@ class DATA_PT_curve_cable:
                 with layout.row(True):
                     layout.prop(curve, "twist_smooth", text="Smooth", slider=True)
                     layout.prop(cable_settings, "average_tilt", text="Average")
+                    layout.operator("object.cable_auto_twist", text="", icon='FORCE_MAGNETIC') # FORCE_MAGNETIC RNA MOD_SCREW
         
         with layout.row():
             with layout.column(True):
@@ -161,12 +178,15 @@ class DATA_PT_curve_cable:
                         layout.prop(curve, "bevel_object", text="")
                         with layout.row(True)(active=bool(curve.bevel_object)):
                             icon = ('RADIOBUT_ON' if curve.use_fill_caps else 'RADIOBUT_OFF')
-                            layout.prop(curve, "use_fill_caps", icon=icon, text="", toggle=True, icon_only=True)
+                            layout.prop(curve, "use_fill_caps", icon=icon, text="", toggle=True)
                 
                 with layout.column(True):
                     layout.prop(cable_settings, "extrude", text="Extrude")
                     layout.prop(cable_settings, "bevel_depth", text="Radius")
                     layout.prop(curve, "bevel_resolution", text="Resolution")
+                    with layout.row(True):
+                        layout.prop(curve, "fill_mode", text="")
+                        layout.prop(curve, "use_fill_deform", text="", icon='SHAPEKEY_DATA', toggle=True)
             
             with layout.column(True):
                 with layout.split(0.4, True):
@@ -175,11 +195,12 @@ class DATA_PT_curve_cable:
                         layout.prop(curve, "taper_object", text="")
                         with layout.row(True)(active=bool(curve.taper_object)):
                             icon = ('RADIOBUT_ON' if curve.use_map_taper else 'RADIOBUT_OFF')
-                            layout.prop(curve, "use_map_taper", icon=icon, text="", toggle=True, icon_only=True)
+                            layout.prop(curve, "use_map_taper", icon=icon, text="", toggle=True)
                 
                 with layout.column(True):
                     layout.prop(cable_settings, "thickness")
                     layout.prop(cable_settings, "offset", slider=True)
+                    layout.prop(cable_settings, "split_angle")
                     
                     bevel_factor_mapping_icons = {'RESOLUTION':'PARTICLE_POINT', 'SEGMENTS':'PARTICLE_TIP', 'SPLINE':'PARTICLE_PATH'}
                     with layout.row(True):
@@ -293,9 +314,9 @@ class CableSettingsPG:
         cable_objects = ([obj] if include_self else [])
         
         def walk_children(parent):
+            if (not tags) or (parent.cable_settings.tag in tags):
+                cable_objects.append(parent)
             for child in parent.children:
-                if (not tags) or (child.cable_settings.tag in tags):
-                    cable_objects.append(child)
                 walk_children(child)
         
         walk_children(encapsulator)
@@ -309,15 +330,31 @@ class CableSettingsPG:
         encapsulator = self._get_child(obj, "CABLE_EXTRAS")
         if not encapsulator: return
         
-        def walk_children(parent, attr_name, layers):
-            if tuple(getattr(parent, attr_name)) != layers:
-                setattr(parent, attr_name, layers)
-            for child in parent.children:
-                walk_children(child, attr_name, layers)
+        scene = bpy.context.scene
+        object_bases = (scene.object_bases if scene else None)
         
-        walk_children(encapsulator, "layers", tuple(obj.layers))
-        # layers_local_view are read-only
-        #walk_children(encapsulator, "layers_local_view", tuple(obj.layers_local_view))
+        v3ds = []
+        for sv3d in SmartView3D.find_in_ui(bpy.context.window):
+            v3d = sv3d.space_data # layers_local_view are here
+            lv3d = v3d.local_view # here layers_local_view are always False
+            if not lv3d: continue
+            if not BlUtil.Object.layers_intersect(v3d, obj, "layers_local_view"): continue
+            v3ds.append(v3d)
+        
+        def walk_children(parent, layers, layers_local_view):
+            if tuple(parent.layers) != layers:
+                parent.layers = layers
+            
+            if object_bases and (tuple(parent.layers_local_view) != layers_local_view):
+                base = object_bases.get(parent.name)
+                if base:
+                    for v3d in v3ds:
+                        base.layers_from_view(v3d)
+            
+            for child in parent.children:
+                walk_children(child, layers, layers_local_view)
+        
+        walk_children(encapsulator, tuple(obj.layers), tuple(obj.layers_local_view))
     
     def _get_modifier(self, obj, md_type, create=False, name=None):
         for modifier in obj.modifiers:
@@ -335,11 +372,6 @@ class CableSettingsPG:
         constraint.name = name or cn_type.capitalize()
         return constraint
     
-    def _get_solidify_modifier(self, create=False):
-        obj = self.id_data
-        if obj.type != 'CURVE': return None
-        return self._get_modifier(obj, 'SOLIDIFY', create)
-    
     def _get_degenerate_mesh(self, non_empty=True, name=None):
         if not name: name = ("DEGENERATE_MESH_NON_EMPTY" if non_empty else "DEGENERATE_MESH_EMPTY")
         mesh = bpy.data.meshes.get(name)
@@ -356,14 +388,35 @@ class CableSettingsPG:
                 v1 = bm.verts.new(Vector())
                 v2 = bm.verts.new(Vector())
                 bm.faces.new([v0, v1, v2])
-                bm.to_mesh(mesh) # clear mesh
+                bm.to_mesh(mesh)
                 bm.free()
         else:
             if mesh.vertices:
                 bm = bmesh.new()
-                bm.to_mesh(mesh) # clear mesh
+                bm.to_mesh(mesh)
                 bm.free()
         if not mesh.materials: mesh.materials.append(None)
+        return mesh
+    
+    def _get_unit_bbox_mesh(self):
+        name = "DEGENERATE_MESH_UNIT_BBOX"
+        mesh = bpy.data.meshes.get(name)
+        if not mesh: mesh = bpy.data.meshes.new(name)
+        p0 = Vector((1,0,0))
+        p1 = Vector((0,1,0))
+        p2 = Vector((0,0,1))
+        rebuild = (len(mesh.vertices) != 3)
+        if not rebuild:
+            rebuild |= (mesh.vertices[0].co != p0)
+            rebuild |= (mesh.vertices[1].co != p1)
+            rebuild |= (mesh.vertices[2].co != p2)
+        if rebuild:
+            bm = bmesh.new()
+            v0 = bm.verts.new(p0)
+            v1 = bm.verts.new(p1)
+            v2 = bm.verts.new(p2)
+            bm.to_mesh(mesh)
+            bm.free()
         return mesh
     
     # Direct parenting is needed to keep things encapsulated.
@@ -387,11 +440,12 @@ class CableSettingsPG:
                 data = self._get_degenerate_mesh(False)
             elif data == 'MESH:1':
                 data = self._get_degenerate_mesh(True)
+            elif data == 'MESH:BBOX':
+                data = self._get_unit_bbox_mesh()
             elif data == 'MESH:CHOOSE':
                 data = self._get_degenerate_mesh(True, "<Select a mesh>")
         child = bpy.data.objects.new(tag, data)
         bpy.context.scene.objects.link(child)
-        #bpy.context.scene.update()
         
         child.cable_settings.tag = tag
         
@@ -406,6 +460,8 @@ class CableSettingsPG:
             constraint.target = obj
         
         if init: init(child)
+        
+        bpy.context.scene.update()
         
         return child
     
@@ -422,13 +478,13 @@ class CableSettingsPG:
     
     def _cable_child_get(self, tag, create=False, data=None, visible=True, constraint=None):
         obj = self.id_data
-        encapsulator = self._get_child(obj, "CABLE_EXTRAS", create=bool(create), data='MESH:1', visible=False, constraint='COPY_TRANSFORMS')
+        encapsulator = self._get_child(obj, "CABLE_EXTRAS", create=bool(create), data='MESH:BBOX', visible=False, constraint='COPY_TRANSFORMS')
         if not encapsulator: return None
         return self._get_child(encapsulator, tag, create=create, data=data, visible=visible, constraint=constraint)
     
     def _cable_child_add(self, tag, init=None, data=None, visible=True, constraint=None):
         obj = self.id_data
-        encapsulator = self._get_child(obj, "CABLE_EXTRAS", create=True, data='MESH:1', visible=False, constraint='COPY_TRANSFORMS')
+        encapsulator = self._get_child(obj, "CABLE_EXTRAS", create=True, data='MESH:BBOX', visible=False, constraint='COPY_TRANSFORMS')
         if not encapsulator: return None
         return self._add_child(encapsulator, tag, init=init, data=data, visible=visible, constraint=constraint)
     
@@ -450,57 +506,6 @@ class CableSettingsPG:
         #child.hide_select = True
         child.hide_render = (not visible)
     
-    def _length_calculator_init(self, length_calc):
-        obj = self.id_data
-        encapsulator = length_calc.parent
-        md_array = self._get_modifier(length_calc, 'ARRAY', True)
-        md_array.fit_type = 'FIT_CURVE'
-        md_array.curve = obj
-        md_array.use_constant_offset = True
-        # Even if source mesh is empty, Blender doesn't skip
-        # the array calculations, so we can't use arbitrary precision
-        # 0.0025 is not too slow on my computer for 400-meter curve
-        md_array.constant_offset_displace = Vector((0, 0, 0.0025))
-        md_array.use_relative_offset = False
-        md_array.use_object_offset = False
-        md_array.use_merge_vertices = False
-        md_array.start_cap = encapsulator
-        md_array.end_cap = encapsulator
-    
-    # This method is called (indirectly) from attachments too
-    # Used by length, update_length_inv, _init_length_driver
-    def _length_calculator_get(self, create=False):
-        obj = self.id_data
-        encapsulator = obj.parent
-        if encapsulator and (encapsulator.cable_settings.tag == "CABLE_EXTRAS"):
-            main_obj = encapsulator.parent
-            if main_obj and main_obj.cable_settings.get_spline():
-                self = main_obj.cable_settings
-        
-        if create: create = self._length_calculator_init
-        # We cannot use absolutely empty mesh, because in this case
-        # Blender will print warnings in the console on each object update
-        return self._cable_child_get("LENGTH_CALC", create=create, data='MESH:1', visible=False)
-    
-    def _get(self):
-        obj, curve = self.get_obj_curve()
-        if not curve: return 0.0
-        length_calc = self._length_calculator_get(True)
-        return length_calc.dimensions.z # will be 0 when just created
-    length = 0.0 | prop("Estimated cable length", "Cable length", get=_get)
-    
-    def update_length_inv(self, create_calculator=False):
-        obj, curve = self.get_obj_curve()
-        if not curve: return
-        
-        length_calc = self._length_calculator_get(create_calculator)
-        if not length_calc: return
-        
-        cable_length = length_calc.dimensions.z # will be 0 when just created
-        cable_length_inv = (0.0 if cable_length == 0 else 1.0 / cable_length)
-        if abs(length_calc.location.z - cable_length_inv) > 0.00001:
-            length_calc.location.z = cable_length_inv
-    
     def _get_driver_fcurve(self, obj, data_path, index=-1, create=False):
         if obj.animation_data:
             for fcurve in obj.animation_data.drivers:
@@ -515,20 +520,27 @@ class CableSettingsPG:
         if not fcurve: return
         fcurve.mute = not enable
     
-    def _init_length_driver(self, fcurve):
+    def _init_driver_single_prop(self, fcurve, id_obj, data_path, driver_type=None, expression="", var_name="var"):
+        if not driver_type: driver_type = ('SCRIPTED' if expression else 'AVERAGE')
+        
         driver = fcurve.driver
-        driver.type = 'AVERAGE' # MIN MAX SCRIPTED SUM AVERAGE
+        driver.type = driver_type # MIN MAX SCRIPTED SUM AVERAGE
+        driver.expression = expression
+        
         var = (driver.variables[0] if driver.variables else driver.variables.new())
-        var.name = "cable_length" # just for clarity (var names matter only in SCRIPTED drivers)
+        var.name = var_name
         var.type = 'SINGLE_PROP' # LOC_DIFF ROTATION_DIFF TRANSFORMS SINGLE_PROP
+        
         # 2 targets for LOC_DIFF, ROTATION_DIFF; 1 for TRANSFORMS, SINGLE_PROP
         target = var.targets[0]
         target.id_type = 'OBJECT'
-        target.id = self._length_calculator_get(True)
-        target.data_path = "dimensions.z"
+        target.id = id_obj
+        target.data_path = data_path
+        
         if (len(fcurve.modifiers) > 1) or (fcurve.modifiers[0].type != 'GENERATOR'):
             while fcurve.modifiers:
                 fcurve.modifiers.remove(fcurve.modifiers[0])
+        
         fmod = (fcurve.modifiers[0] if len(fcurve.modifiers) else fcurve.modifiers.new(type='GENERATOR'))
         fmod.mode = 'POLYNOMIAL' # 'POLYNOMIAL', 'POLYNOMIAL_FACTORISED'
         fmod.use_additive = False
@@ -536,22 +548,127 @@ class CableSettingsPG:
         fmod.coefficients = [0.0, 1.0] # just some sane default
         fmod.use_restricted_range = False
         fmod.use_influence = False
+        
         if hasattr(fcurve, "update"): fcurve.update() # absent in 2.70
+    
+    def _update_driver_single_prop(self, fcurve, coefficients=None, var_id=0, **kwargs):
+        driver = fcurve.driver
+        
+        if var_id >= len(driver.variables):
+            var = driver.variables[0]
+            target = var.targets[0]
+            id_obj = target.id
+            data_path = target.data_path
+            while var_id >= len(driver.variables):
+                var = driver.variables.new()
+                var.type = 'SINGLE_PROP'
+                target = var.targets[0]
+                target.id_type = 'OBJECT'
+                target.id = id_obj
+                target.data_path = data_path
+        
+        var = driver.variables[var_id]
+        target = var.targets[0]
+        
+        for k, v in kwargs.items():
+            if k == "expression":
+                driver.type = 'SCRIPTED'
+                driver.expression = v
+            elif k == "driver_type":
+                driver.type = v
+            elif k == "var_name":
+                var.name = v
+            elif k == "id_obj":
+                target.id = v
+            elif k == "data_path":
+                target.data_path = v
+        
+        if coefficients:
+            fmod = fcurve.modifiers[0] # expected to be 'GENERATOR'
+            fmod.mode = 'POLYNOMIAL'
+            fmod.poly_order = len(coefficients) - 1
+            fmod.coefficients = coefficients
+        
+        if hasattr(fcurve, "update"): fcurve.update() # absent in 2.70
+    
+    def _get_main_cable_settings(self):
+        obj = self.id_data
+        encapsulator = obj.parent
+        if encapsulator and (encapsulator.cable_settings.tag == "CABLE_EXTRAS"):
+            main_obj = encapsulator.parent
+            if main_obj and main_obj.cable_settings.get_spline():
+                self = main_obj.cable_settings
+        return self
+    
+    # Length-calculation methods and properties
+    def _length_calculator_init(self, length_calc):
+        obj = self.id_data
+        #encapsulator = length_calc.parent
+        md_array = self._get_modifier(length_calc, 'ARRAY', True)
+        md_array.fit_type = 'FIT_CURVE'
+        md_array.curve = obj
+        md_array.use_constant_offset = True
+        # Even if source mesh is empty, Blender doesn't skip
+        # the array calculations, so we can't use arbitrary precision
+        # 0.0025 is not too slow on my computer for 400-meter curve
+        md_array.constant_offset_displace = Vector((0, 0, 0.0025))
+        md_array.use_relative_offset = False
+        md_array.use_object_offset = False
+        md_array.use_merge_vertices = False
+        #md_array.start_cap = encapsulator
+        #md_array.end_cap = encapsulator
+        length_calc.scale = Vector((0,0,0))
+    
+    # This method is called (indirectly) from attachments too
+    # Used by calculate_length, _init_length_driver
+    def _length_calculator_get(self, create=False):
+        self = self._get_main_cable_settings()
+        if create: create = self._length_calculator_init
+        # We cannot use absolutely empty mesh, because in this case
+        # Blender will print warnings in the console on each object update
+        return self._cable_child_get("LENGTH_CALC", create=create, data='MESH:1', visible=False)
+    
+    length_calc_prop = "bound_box[1][2]"
+    length_calc_value = (lambda self, length_calc: length_calc.bound_box[1][2])
+    
+    def calculate_length(self, create=False):
+        obj, curve = self.get_obj_curve()
+        if not curve: return 0.0
+        encapsulator = self._get_child(obj, "CABLE_EXTRAS")
+        delete_afterwards = (not encapsulator) and (not create)
+        length_calc = self._length_calculator_get(True)
+        value = self.length_calc_value(length_calc)
+        if delete_afterwards:
+            self._cable_child_delete(length_calc)
+            self._cable_child_delete(encapsulator)
+        return value
+    
+    def _init_length_driver(self, fcurve):
+        id_obj = self._length_calculator_get(True)
+        data_path = self.length_calc_prop
+        self._init_driver_single_prop(fcurve, id_obj, data_path)
     
     def _set_length_driver(self, obj, data_path, index, coefficients, inverse=False):
         fcurve = self._get_driver_fcurve(obj, data_path, index, create=self._init_length_driver)
-        
-        driver = fcurve.driver
-        var = driver.variables[0]
-        target = var.targets[0]
-        target.data_path = ("location.z" if inverse else "dimensions.z")
-        
-        fmod = fcurve.modifiers[0] # expected to be 'GENERATOR'
-        fmod.mode = 'POLYNOMIAL'
-        fmod.poly_order = len(coefficients) - 1
-        fmod.coefficients = coefficients
-        
-        if hasattr(fcurve, "update"): fcurve.update() # absent in 2.70
+        self._update_driver_single_prop(fcurve, coefficients, data_path=self.length_calc_prop,
+            expression=("1.0/{}" if inverse else "{}").format("var"), var_name="var")
+    
+    def _init_scale_driver(self, fcurve):
+        main_self = self._get_main_cable_settings()
+        encapsulator = main_self._get_child(main_self.id_data, "CABLE_EXTRAS")
+        self._init_driver_single_prop(fcurve, encapsulator, "dimensions.x", expression="x")
+    
+    def _set_scale_driver(self, obj, data_path, index, axis, coefficients, inverse=False):
+        fcurve = self._get_driver_fcurve(obj, data_path, index, create=self._init_scale_driver)
+        if axis == "magnitude":
+            magnitude_expr = "sqrt(x*x + y*y + z*z)"
+            self._update_driver_single_prop(fcurve, data_path="dimensions.x", var_name="x", var_id=0)
+            self._update_driver_single_prop(fcurve, data_path="dimensions.y", var_name="y", var_id=1)
+            self._update_driver_single_prop(fcurve, data_path="dimensions.z", var_name="z", var_id=2)
+            self._update_driver_single_prop(fcurve, coefficients, expression=("1.0/({})" if inverse else "{}").format(magnitude_expr))
+        else:
+            self._update_driver_single_prop(fcurve, coefficients, data_path="dimensions."+axis,
+                expression=("1.0/{}" if inverse else "{}").format(axis), var_name=axis)
     
     # Object-based properties
     def _get(self):
@@ -571,6 +688,8 @@ class CableSettingsPG:
         fill_mode = ('FULL' if curve.dimensions == '3D' else 'NONE')
         if curve.fill_mode != fill_mode: return False
         if curve.offset != 0.0: return False
+        if curve.use_stretch: return False
+        if curve.use_deform_bounds: return False
         return True
     def _set(self, value):
         obj, curve = self.get_obj_curve()
@@ -579,6 +698,8 @@ class CableSettingsPG:
             fill_mode = ('FULL' if curve.dimensions == '3D' else 'NONE')
             curve.fill_mode = fill_mode
             curve.offset = 0.0
+            curve.use_stretch = False
+            curve.use_deform_bounds = False
     is_cable = True | prop("Cable sanity check", "Is cable", get=_get, set=_set)
     
     def _get(self):
@@ -631,47 +752,73 @@ class CableSettingsPG:
     average_tilt = 0.0 | prop("Average tilt", "Average tilt", get=_get, set=_set, subtype='ANGLE', unit='ROTATION')
     
     # Modifier-based properties (Solidify)
+    def _get_curve_modifier(self, kind, create=False):
+        obj = self.id_data
+        if obj.type != 'CURVE': return None
+        # these modifiers are not orthogonal
+        return dict(
+            solidify = self._get_modifier(obj, 'SOLIDIFY', create),
+            edge_split = self._get_modifier(obj, 'EDGE_SPLIT', create),
+        ).get(kind)
+    
     def _get(self):
-        solidify = self._get_solidify_modifier()
+        solidify = self._get_curve_modifier("solidify")
         if not solidify: return 0.0
         return -solidify.thickness
     def _set(self, value):
-        solidify = self._get_solidify_modifier(value != 0.0)
+        value_non_default = (value != 0.0)
+        solidify = self._get_curve_modifier("solidify", value_non_default)
         if not solidify: return
-        solidify.show_viewport = (value != 0.0)
-        solidify.show_render = (value != 0.0)
+        solidify.show_viewport = value_non_default
+        solidify.show_render = value_non_default
         solidify.thickness = -value
     thickness = 0.0 | prop("Thickness of the shell", "Thickness", get=_get, set=_set, step=0.1, precision=4)
     
     def _get(self):
-        solidify = self._get_solidify_modifier()
+        solidify = self._get_curve_modifier("solidify")
         if not solidify: return -1.0
         return solidify.offset
     def _set(self, value):
-        solidify = self._get_solidify_modifier(True)
+        solidify = self._get_curve_modifier("solidify", True)
         if not solidify: return
         solidify.offset = value
     offset = -1.0 | prop("Offset the thickness from the center", "Offset", get=_get, set=_set, min=-1.0, max=1.0, step=1, precision=4)
     
     def _get(self):
-        solidify = self._get_solidify_modifier()
+        solidify = self._get_curve_modifier("solidify")
         if not solidify: return False
         return solidify.use_even_offset
     def _set(self, value):
-        solidify = self._get_solidify_modifier(True)
+        solidify = self._get_curve_modifier("solidify", True)
         if not solidify: return
         solidify.use_even_offset = value
     use_even_offset = False | prop("Maintain thickness by adjusting to sharp corners (slow)", "Even thickness", get=_get, set=_set)
     
     def _get(self):
-        solidify = self._get_solidify_modifier()
+        solidify = self._get_curve_modifier("solidify")
         if not solidify: return False
         return solidify.use_rim_only
     def _set(self, value):
-        solidify = self._get_solidify_modifier(True)
+        solidify = self._get_curve_modifier("solidify", True)
         if not solidify: return
         solidify.use_rim_only = value
     use_rim_only = False | prop("Only add the rim to the original data", "Only rim", get=_get, set=_set)
+    
+    # Modifier-based properties (Edge Split)
+    def _get(self):
+        edge_split = self._get_curve_modifier("edge_split")
+        if not edge_split: return math.pi
+        return edge_split.split_angle
+    def _set(self, value):
+        value_non_default = (abs(value - math.pi) > 1e-6)
+        edge_split = self._get_curve_modifier("edge_split", value_non_default)
+        if not edge_split: return
+        edge_split.show_viewport = value_non_default
+        edge_split.show_render = value_non_default
+        edge_split.split_angle = value
+        edge_split.use_edge_angle = value_non_default
+        edge_split.use_edge_sharp = False # curve doesn't have sharp-marked edges anyway
+    split_angle = math.pi | prop("Angle above which to split edges", "Split Angle", get=_get, set=_set, min=0.0, max=math.pi, subtype='ANGLE', unit='ROTATION')
     
     # Wire-related methods & properties
     def wire_update(self):
@@ -697,8 +844,6 @@ class CableSettingsPG:
         wire_obj = self._cable_child_get("WIRES", create=True, data='MESH')
         if not wire_obj: return
         self._cable_child_set_visibility(wire_obj, True)
-        
-        self.update_length_inv(True)
         
         wire_type = ('BRAIDED' if self.wire_is_braided else 'BUS')
         
@@ -805,8 +950,11 @@ class CableSettingsPG:
         bm.to_mesh(mesh)
         bm.free()
         
-        def drive_modifier_by_length(md, data_path, index, coefs):
-            self._set_length_driver(wire_obj, "modifiers[\"{}\"].{}".format(md.name, data_path), index, coefs)
+        def drive_modifier_by_length(md, data_path, index, coefs, inverse=False):
+            self._set_length_driver(wire_obj, "modifiers[\"{}\"].{}".format(md.name, data_path), index, coefs, inverse=inverse)
+        
+        def drive_constraint_by_scale(cn, data_path, index, axis, coefs, inverse=False):
+            self._set_scale_driver(wire_obj, "constraints[\"{}\"].{}".format(cn.name, data_path), index, axis, coefs, inverse=inverse)
         
         md_screw = self._get_modifier(wire_obj, 'SCREW', True)
         drive_modifier_by_length(md_screw, "angle", -1, (0.0, wire_twisting))
@@ -826,6 +974,20 @@ class CableSettingsPG:
         md_curve = self._get_modifier(wire_obj, 'CURVE', True)
         md_curve.deform_axis = 'POS_Z'
         md_curve.object = obj
+        
+        # compensation scale (along screw axis only!) = (3 ^ 0.5) / ((scale.x^2 + scale.y^2 + scale.z^2) ^ 0.5)
+        cn_limit_scl = self._get_constraint(wire_obj, 'LIMIT_SCALE', True)
+        root3 = math.sqrt(3) # diagonal of a unit cube
+        drive_constraint_by_scale(cn_limit_scl, "min_z", -1, "magnitude", (0.0, root3), inverse=True)
+        drive_constraint_by_scale(cn_limit_scl, "max_z", -1, "magnitude", (0.0, root3), inverse=True)
+        cn_limit_scl.use_min_x = False
+        cn_limit_scl.use_max_x = False
+        cn_limit_scl.use_min_y = False
+        cn_limit_scl.use_max_y = False
+        cn_limit_scl.use_min_z = True
+        cn_limit_scl.use_max_z = True
+        cn_limit_scl.use_transform_limit = False
+        cn_limit_scl.owner_space = 'LOCAL'
         
         # Wire caps
         wire_cap0_obj = self._get_child(wire_obj, "WIRES_CAP0", True, data='MESH')
@@ -987,8 +1149,6 @@ class CableSettingsPG:
         if not obj: return
         if obj.type != 'CURVE': return
         curve = obj.data
-        
-        obj.cable_settings.update_length_inv(True)
         
         def enable_modifier(md, enable):
             md.show_render = enable
@@ -1332,6 +1492,23 @@ def select_whole_subheirarchy(self, context, event):
         obj.hide_select = False
         obj.select = True
 
+@addon.Operator(idname="object.cable_unselect_children", description="Make wires/attachments non-selectable")
+def cable_unselect_children(self, context, event):
+    obj = context.object
+    if not obj: return
+    
+    cable_settings = obj.cable_settings
+    if not cable_settings.get_obj_curve(): return
+    
+    tags_hide = {"CABLE_EXTRAS", "LENGTH_CALC"}
+    
+    cable_objects = cable_settings.collect_cable_objects(include_self=False)
+    for child in cable_objects:
+        child.select = False
+        child.hide_select = True
+        if cable_objects.cable_settings.tag in tags_hide:
+            child.hide = True
+
 @addon.Operator(idname="object.cable_to_mesh", description="Convert cable to mesh")
 def cable_to_mesh(self, context, event):
     obj = context.object
@@ -1380,6 +1557,94 @@ def cable_to_mesh(self, context, event):
     
     bpy.ops.ed.undo_push(message="Cable to mesh")
 
+@addon.Operator(idname="object.cable_auto_twist", label="Auto twist curve")
+class CableAutoTwistOperator:
+    fix_start = True | prop("Fix start", "Fix start")
+    fix_end = False | prop("Fix end", "Fix end")
+    angle_start = 0.0 | prop("Start angle", "Start angle", subtype='ANGLE', unit='ROTATION')
+    angle_end = 0.0 | prop("End angle", "End angle", subtype='ANGLE', unit='ROTATION')
+    mode = 'CURVE' | prop("Angle interpretation", "Angle per", items=[
+        # mapping distance along curve to control points can be complicated, especially for NURBS
+        #('LENGTH', "Length", "Angle per unit length"),
+        ('SEGMENT', "Segment", "Angle per curve segment"),
+        ('CURVE', "Curve", "Angle per whole curve"),
+    ])
+    angle = 0.0 | prop("Angle", "Angle", subtype='ANGLE', unit='ROTATION')
+    
+    def execute(self, context):
+        n_segments = len(self.points) - 1
+        if self.fix_start and self.fix_end:
+            angle0 = self.angle_start
+            angle_delta = clamp_angle(self.angle_end - self.angle_start)
+            twopi = math.pi*2
+            n = round(abs(self.angle) / twopi)
+            angle1 = angle0 + angle_delta + math.copysign(twopi * n, self.angle)
+            angle_step = ((angle1 - angle0) / n_segments if n_segments > 0 else 0.0)
+            print((math.degrees(angle0), math.degrees(angle1), math.degrees(angle_step)))
+        elif self.mode == 'SEGMENT':
+            angle_step = self.angle
+            if self.fix_start:
+                angle0 = self.angle_start
+            else:
+                angle0 = self.angle_end - angle_step * n_segments
+                angle1 = self.angle_end
+        elif self.mode == 'CURVE':
+            angle_step = (self.angle / n_segments if n_segments > 0 else 0.0)
+            if self.fix_start:
+                angle0 = self.angle_start
+            else:
+                angle0 = self.angle_end - angle_step * n_segments
+                angle1 = self.angle_end
+        
+        angle = angle0
+        for point in self.points:
+            point.tilt = angle
+            angle += angle_step
+        
+        if self.fix_end and (not self.fix_start):
+            self.points[-1].tilt = angle1 # to not accumulate errors
+        
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        obj = context.object
+        if not obj: return {'CANCELLED'}
+        
+        cable_settings = obj.cable_settings
+        spline = cable_settings.get_spline()
+        if not spline: return {'CANCELLED'}
+        
+        points = (spline.bezier_points if spline.type == 'BEZIER' else spline.points)
+        if not points: return {'CANCELLED'}
+        
+        self.obj = obj
+        self.cable_settings = cable_settings
+        self.spline = spline
+        self.points = points
+        
+        self.angle_start = points[0].tilt
+        self.angle_end = points[-1].tilt
+        
+        wm = context.window_manager
+        return wm.invoke_props_dialog(self)
+    
+    def draw(self, context):
+        layout = NestedLayout(self.layout)
+        
+        with layout.row():
+            with layout.row(True):
+                layout.prop(self, "fix_start", text="", icon='PINNED', toggle=True)
+                layout.prop(self, "angle_start", text="Start")
+            with layout.row(True):
+                layout.prop(self, "fix_end", text="", icon='PINNED', toggle=True)
+                layout.prop(self, "angle_end", text="End")
+        
+        with layout.row():
+            layout.prop(self, "angle", text="Angle")
+            with layout.row()(alignment='CENTER'):
+                layout.label(text="per")
+            layout.prop(self, "mode", text="")
+
 addon.type_extend("Object", "cable_settings", CableSettingsPG)
 
 prev_template_ids = None
@@ -1393,8 +1658,6 @@ def scene_update_post(scene):
     if not obj: return
     cable_settings = obj.cable_settings
     if not cable_settings.get_spline(): return
-    
-    cable_settings.update_length_inv()
     
     cable_settings.propagate_layers_to_children()
     
