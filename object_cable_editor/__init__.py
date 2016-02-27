@@ -72,19 +72,28 @@ cable editor:
 + attachments: assign materials from the main UI
 + auto-twisting: fix start point, fix end point, fix some point in between? twist per length, twist n times
 + check if it's possible to make wires/attachments stay with cable in Local View mode
-    issues I cannot fix:
-    * when entering local view, the view zooms out to show local-view objects. Length calculator can be a very large object, depending on curve length
-    * when going out of local view, all local-view objects are selected (and made selectable)
+    * NOTE: when going out of local view, all local-view objects are selected (and made selectable)
 + add Edge Split modifier options for cable
 + add curve fill mode to the Cable panel
 + operator to make cable children non-selectable
+  option to actually make curve object hidden (not just wireframe)
+  custom wire profile
+  option to specify profile/width/height/rotation of individual wires
   multi-row bus cable
+  "filled-in" braided cable? (many wires of small size, not just on the outer radius, but everywhere inside)
   multiple layers of wires
-  implement fix for scaling wires
++ implement fix for scaling wires
   moth3r asks to implement presets system
   moth3r asks for procedural custom curve profiles
   moth3r suggests to provide the ability to use particles and selected vertices as targets for cables'/wires' ends
   add option for "sides" profile (as seen in the example moth3r showed)
+
+moth3r:
+In regards, cable editor, I would like to add an option 'None' to the Half, Full, Side etc. so in that way profile would be turned off for sure. It is also straight forward way to do it.
+OR: add a on/off switch for profile (keep radius/extrude in separate vars)
+Maybe it would be good to completely separate profile from wires settings. On example, right now Extrude and radius settings are shared in-between. I guess that makes sens but kinda is confusing when you try to figure what is controlling what. 
+
+wires has inverted normals for some guy, but when moth3r opened his file, the normals were correct
 
 add warnings to documentation about issues with scale, default coversion to mesh, joining multiple curves into one object, etc.
 
@@ -95,6 +104,16 @@ For cable systems:
 
 moth3r calls the following case a "zigzag":
 http://ep.yimg.com/ay/directron/black-silverstone-sleeved-3-x-peripheral-4pin-1-x-floppy-4pin-cable-p-n-pp06b-3per10f-5.gif
+
+See this for an example of dealing with hair particles
+https://svn.blender.org/svnroot/bf-extensions/contrib/py/scripts/addons/btrace/bTrace.py
+
+https://www.orbolt.com/asset/Dan_Baciu::DB_cable_bundle
+
+http://cgterminal.com/2013/10/05/cinema-4d-tip-using-collision-deformer-to-tape-cables-together/
+
+Some cool (but not priority) ideas:
+https://vimeo.com/35145361
 """
 
 # bevel factor mapping does not exit in 2.70
@@ -520,7 +539,7 @@ class CableSettingsPG:
         if not fcurve: return
         fcurve.mute = not enable
     
-    def _init_driver_single_prop(self, fcurve, id_obj, data_path, driver_type=None, expression="", var_name="var"):
+    def _init_driver_single_prop(self, fcurve, id_obj=None, data_path="", driver_type=None, expression="", var_name="var"):
         if not driver_type: driver_type = ('SCRIPTED' if expression else 'AVERAGE')
         
         driver = fcurve.driver
@@ -651,7 +670,7 @@ class CableSettingsPG:
     def _set_length_driver(self, obj, data_path, index, coefficients, inverse=False):
         fcurve = self._get_driver_fcurve(obj, data_path, index, create=self._init_length_driver)
         self._update_driver_single_prop(fcurve, coefficients, data_path=self.length_calc_prop,
-            expression=("1.0/{}" if inverse else "{}").format("var"), var_name="var")
+            expression=("1.0/max({}, 1e-6)" if inverse else "{}").format("var"), var_name="var")
     
     def _init_scale_driver(self, fcurve):
         main_self = self._get_main_cable_settings()
@@ -665,10 +684,25 @@ class CableSettingsPG:
             self._update_driver_single_prop(fcurve, data_path="dimensions.x", var_name="x", var_id=0)
             self._update_driver_single_prop(fcurve, data_path="dimensions.y", var_name="y", var_id=1)
             self._update_driver_single_prop(fcurve, data_path="dimensions.z", var_name="z", var_id=2)
-            self._update_driver_single_prop(fcurve, coefficients, expression=("1.0/({})" if inverse else "{}").format(magnitude_expr))
+            self._update_driver_single_prop(fcurve, coefficients, expression=("1.0/max({}, 1e-6)" if inverse else "{}").format(magnitude_expr))
         else:
             self._update_driver_single_prop(fcurve, coefficients, data_path="dimensions."+axis,
                 expression=("1.0/{}" if inverse else "{}").format(axis), var_name=axis)
+    
+    def _init_length_scale_driver(self, fcurve):
+        main_self = self._get_main_cable_settings()
+        encapsulator = main_self._get_child(main_self.id_data, "CABLE_EXTRAS")
+        length_calc = main_self._length_calculator_get(True)
+        
+        self._init_driver_single_prop(fcurve)
+        self._update_driver_single_prop(fcurve, var_id=0, var_name="L", id_obj=length_calc, data_path=self.length_calc_prop)
+        self._update_driver_single_prop(fcurve, var_id=1, var_name="SX", id_obj=encapsulator, data_path="dimensions.x")
+        self._update_driver_single_prop(fcurve, var_id=2, var_name="SY", id_obj=encapsulator, data_path="dimensions.y")
+        self._update_driver_single_prop(fcurve, var_id=3, var_name="SZ", id_obj=encapsulator, data_path="dimensions.z")
+    
+    def _set_length_scale_driver(self, obj, data_path, index, expresion, coefficients):
+        fcurve = self._get_driver_fcurve(obj, data_path, index, create=self._init_length_scale_driver)
+        self._update_driver_single_prop(fcurve, coefficients, expression=expresion)
     
     # Object-based properties
     def _get(self):
@@ -950,16 +984,20 @@ class CableSettingsPG:
         bm.to_mesh(mesh)
         bm.free()
         
-        def drive_modifier_by_length(md, data_path, index, coefs, inverse=False):
-            self._set_length_driver(wire_obj, "modifiers[\"{}\"].{}".format(md.name, data_path), index, coefs, inverse=inverse)
-        
-        def drive_constraint_by_scale(cn, data_path, index, axis, coefs, inverse=False):
-            self._set_scale_driver(wire_obj, "constraints[\"{}\"].{}".format(cn.name, data_path), index, axis, coefs, inverse=inverse)
+        # Note: compensation scale = (3 ^ 0.5) / ((scale.x^2 + scale.y^2 + scale.z^2) ^ 0.5)
+        def drive_by_length_scale(target, data_path, index, expresion, coefficients):
+            if isinstance(target, bpy.types.Modifier):
+                data_path = "modifiers[\"{}\"].{}".format(target.name, data_path)
+                target = wire_obj
+            elif isinstance(target, bpy.types.Constraint):
+                data_path = "constraints[\"{}\"].{}".format(target.name, data_path)
+                target = wire_obj
+            self._set_length_scale_driver(target, data_path, index, expresion, coefficients)
         
         md_screw = self._get_modifier(wire_obj, 'SCREW', True)
-        drive_modifier_by_length(md_screw, "angle", -1, (0.0, wire_twisting))
-        drive_modifier_by_length(md_screw, "screw_offset", -1, (0.0, 1.0))
-        drive_modifier_by_length(md_screw, "steps", -1, (0.0, 1.0/self.wire_step))
+        drive_by_length_scale(md_screw, "angle", -1, "L * sqrt(3.0 / (SX*SX + SY*SY + SZ*SZ))", (0.0, wire_twisting))
+        drive_by_length_scale(md_screw, "steps", -1, "L * sqrt(3.0 / (SX*SX + SY*SY + SZ*SZ))", (0.0, 1.0/self.wire_step))
+        drive_by_length_scale(md_screw, "screw_offset", -1, "L * sqrt(3.0 / (SX*SX + SY*SY + SZ*SZ))", (0.0, 1.0))
         md_screw.axis = 'Z'
         md_screw.object = None
         md_screw.iterations = 1
@@ -974,20 +1012,6 @@ class CableSettingsPG:
         md_curve = self._get_modifier(wire_obj, 'CURVE', True)
         md_curve.deform_axis = 'POS_Z'
         md_curve.object = obj
-        
-        # compensation scale (along screw axis only!) = (3 ^ 0.5) / ((scale.x^2 + scale.y^2 + scale.z^2) ^ 0.5)
-        cn_limit_scl = self._get_constraint(wire_obj, 'LIMIT_SCALE', True)
-        root3 = math.sqrt(3) # diagonal of a unit cube
-        drive_constraint_by_scale(cn_limit_scl, "min_z", -1, "magnitude", (0.0, root3), inverse=True)
-        drive_constraint_by_scale(cn_limit_scl, "max_z", -1, "magnitude", (0.0, root3), inverse=True)
-        cn_limit_scl.use_min_x = False
-        cn_limit_scl.use_max_x = False
-        cn_limit_scl.use_min_y = False
-        cn_limit_scl.use_max_y = False
-        cn_limit_scl.use_min_z = True
-        cn_limit_scl.use_max_z = True
-        cn_limit_scl.use_transform_limit = False
-        cn_limit_scl.owner_space = 'LOCAL'
         
         # Wire caps
         wire_cap0_obj = self._get_child(wire_obj, "WIRES_CAP0", True, data='MESH')
@@ -1017,8 +1041,8 @@ class CableSettingsPG:
         
         self._cable_child_set_visibility(wire_cap1_obj, True)
         wire_cap1_obj.data = cap_mesh
-        self._set_length_driver(wire_cap1_obj, "location", 2, (0.0, 1.0))
-        self._set_length_driver(wire_cap1_obj, "rotation_euler", 2, (0.0, wire_twisting))
+        drive_by_length_scale(wire_cap1_obj, "location", 2, "L * sqrt(3.0 / (SX*SX + SY*SY + SZ*SZ))", (0.0, 1.0))
+        drive_by_length_scale(wire_cap1_obj, "rotation_euler", 2, "L * sqrt(3.0 / (SX*SX + SY*SY + SZ*SZ))", (0.0, wire_twisting))
         
         md_curve = self._get_modifier(wire_cap1_obj, 'CURVE', True)
         md_curve.deform_axis = 'POS_Z'
@@ -1523,6 +1547,7 @@ def cable_to_mesh(self, context, event):
     
     include_self = not ((cable_settings.is_wireframe or obj.hide) and obj.hide_render)
     cable_objects = cable_settings.collect_cable_objects(include_self=include_self, tags=CableSettingsPG.tags_visible)
+    cable_objects = [cable_obj for cable_obj in cable_objects if not cable_obj.hide]
     
     mesh_baker = MeshBaker(
         scene=context.scene,
